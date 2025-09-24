@@ -19,7 +19,10 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 import os
 import ray
 import hydra
+import sys
+import os
 
+# ray.init(runtime_env={"env_vars":{"RAY_DEBUG"}})
 
 def get_custom_reward_fn(config):
     import importlib.util, sys
@@ -77,10 +80,25 @@ def run_ppo(config) -> None:
     ray.get(runner.run.remote(config))
 
 
+def set_all_seeds(seed: int, rank: int = 0):
+    import random, numpy as np, torch
+    final_seed = seed + rank  # 保证每个进程独立但可控
+    random.seed(final_seed)
+    np.random.seed(final_seed)
+    torch.manual_seed(final_seed)
+    torch.cuda.manual_seed_all(final_seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
 class TaskRunner:
 
     def run(self, config):
+        rank = int(os.environ.get("RANK", 0))  # 多进程环境中 RANK 设置
+        print("rank:",rank)
+        set_all_seeds(42, rank=rank)
+        
         from verl.utils.fs import copy_to_local
         # print initial config
         from pprint import pprint
@@ -191,6 +209,7 @@ class TaskRunner:
                                 reward_fn=reward_fn,
                                 val_reward_fn=val_reward_fn)
         trainer.init_workers()
+        # breakpoint()
         trainer.fit()
 
 

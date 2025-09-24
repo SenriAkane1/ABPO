@@ -439,7 +439,7 @@ class ActorRolloutRefWorker(Worker):
     def update_actor(self, data: DataProto):
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
-
+        # breakpoint()
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -482,8 +482,9 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def generate_sequences(self, prompts: DataProto):
+    def generate_sequences(self, prompts: DataProto,use_gt=False):
         # Support all hardwares
+        # breakpoint()
         prompts = prompts.to(torch.cuda.current_device())
 
         assert self._is_rollout
@@ -508,9 +509,9 @@ class ActorRolloutRefWorker(Worker):
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
 
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
-
+            # breakpoint()
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
+            output = self.rollout.generate_sequences(prompts=prompts,use_gt=use_gt)
             log_gpu_memory_usage('After rollout generation', logger=logger)
 
             output = self.rollout_sharding_manager.postprocess_data(output)
@@ -537,6 +538,12 @@ class ActorRolloutRefWorker(Worker):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
+            use_Pold =  self.config.get("use_Pold",True)
+            if not use_Pold:
+                output = torch.zeros_like(data.batch['responses'])
+                print(output)
+            else:
+                output = self.actor.compute_log_prob(data=data)
             output = self.actor.compute_log_prob(data=data)
             output = DataProto.from_dict(tensors={'old_log_probs': output},
                                          meta_info={'temperature': self.config.rollout.temperature})

@@ -234,6 +234,7 @@ class DataParallelPPOActor(BasePPOActor):
 
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
+        # breakpoint()
         self.actor_module.train()
 
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
@@ -294,7 +295,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # all return: (bsz, response_length)
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
-
+                    # breakpoint()
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,

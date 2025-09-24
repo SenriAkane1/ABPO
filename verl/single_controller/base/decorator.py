@@ -126,6 +126,7 @@ def dispatch_megatron_compute_data_proto(worker_group, *args, **kwargs):
     return dispatch_megatron_compute(worker_group, *splitted_args, **splitted_kwargs)
 
 
+
 def _concat_data_proto_or_future(output: List):
     from verl.protocol import DataProto, DataProtoFuture
     import ray

@@ -37,6 +37,54 @@ try:
 except:
     pass
 
+import torch
+import torch.nn.functional as F
+from tensordict import TensorDict
+
+PAD_TOKEN_ID_DEFAULT = 151643
+
+def _pad_core_keys(td: TensorDict, target_len: int, pad_token_id: int = PAD_TOKEN_ID_DEFAULT) -> TensorDict:
+    """只 pad 四个核心键，其余保持原样"""
+    cur_len = td['responses'].shape[1]
+    if cur_len == target_len:
+        return td
+
+    pad_len = target_len - cur_len
+    print("pad_len",pad_len)
+    # pad 四个核心键
+    td = td.clone()  # 浅拷贝，避免原始 TensorDict 被修改
+    td['attention_mask'] = F.pad(td['attention_mask'], (0, pad_len), value=0)
+    td['input_ids']      = F.pad(td['input_ids'],      (0, pad_len), value=pad_token_id)
+    td['responses']      = F.pad(td['responses'],      (0, pad_len), value=pad_token_id)
+
+    # position_ids 连续递增
+    pos = td['position_ids']
+    device, dtype = pos.device, pos.dtype
+    delta = torch.arange(1, pad_len + 1, device=device, dtype=dtype).unsqueeze(0).expand(len(td), -1)
+    padding_pos = pos[:, -1:] + delta
+    td['position_ids'] = torch.cat([pos, padding_pos], dim=-1)
+
+    return td
+
+
+def concat_tensordict_many(tds: list[TensorDict], pad_token_id: int = PAD_TOKEN_ID_DEFAULT) -> TensorDict:
+    """拼接多个 TensorDict：核心四键右侧 pad，其余键直接 cat"""
+    items = [td for td in tds if td is not None]
+    if not items:
+        return None
+    if len(items) == 1:
+        return items[0]
+    
+
+    if "responses" in items[0].keys():
+        target_len = max(td["responses"].shape[1] for td in items)
+        padded = [_pad_core_keys(td, target_len, pad_token_id) for td in items]
+        return torch.cat(padded, dim=0)
+    else:
+        return torch.cat(items, dim=0)
+
+
+
 
 def pad_dataproto_to_divisor(data: 'DataProto', size_divisor: int):
     """Pad a DataProto to size divisible by size_divisor
@@ -62,6 +110,7 @@ def pad_dataproto_to_divisor(data: 'DataProto', size_divisor: int):
         pad_size = 0
         data_padded = data
     return data_padded, pad_size
+
 
 
 def unpad_dataproto(data: 'DataProto', pad_size):
@@ -597,38 +646,85 @@ class DataProto:
 
         return iter(get_data())
 
-    def chunk(self, chunks: int) -> List['DataProto']:
-        """Split the batch among dim=0 into chunks. The meta_info is passed to each DataProto after split.
+    # def chunk(self, chunks: int) -> List['DataProto']:
+    #     """Split the batch among dim=0 into chunks. The meta_info is passed to each DataProto after split.
+
+    #     Args:
+    #         chunks (int): the number of chunks to split on dim=0
+
+    #     Returns:
+    #         List[DataProto]: a list of DataProto after splitting
+    #     """
+    #     assert len(
+    #         self) % chunks == 0, f'only support equal chunk. Got size of DataProto {len(self)} and chunk {chunks}.'
+
+    #     if self.batch is not None:
+    #         batch_lst = self.batch.chunk(chunks=chunks, dim=0)
+    #     else:
+    #         batch_lst = [None for _ in range(chunks)]
+
+    #     non_tensor_batch_lst = [{} for _ in range(chunks)]
+    #     for key, val in self.non_tensor_batch.items():
+    #         assert isinstance(val, np.ndarray)
+    #         non_tensor_lst = np.array_split(val, chunks)
+    #         assert len(non_tensor_lst) == chunks
+    #         for i in range(chunks):
+    #             non_tensor_batch_lst[i][key] = non_tensor_lst[i]
+
+    #     output = []
+    #     for i in range(chunks):
+    #         output.append(
+    #             DataProto(batch=batch_lst[i], non_tensor_batch=non_tensor_batch_lst[i], meta_info=self.meta_info))
+
+    #     return output
+
+    #ABPO 修改
+    def chunk(self, chunks: Union[int, List[int]]) -> List['DataProto']:
+        """Split along dim=0 into possibly-unequal chunks.
 
         Args:
-            chunks (int): the number of chunks to split on dim=0
+            chunks: If `int`, split into that many chunks as evenly as possible (front chunks may be +1).
+                    If `List[int]`, treat as explicit sizes; sum must equal len(self).
 
         Returns:
-            List[DataProto]: a list of DataProto after splitting
+            List[DataProto]: list of sliced DataProto pieces (length == chunks if int; else len(sizes))
         """
-        assert len(
-            self) % chunks == 0, f'only support equal chunk. Got size of DataProto {len(self)} and chunk {chunks}.'
+        N = len(self)
 
-        if self.batch is not None:
-            batch_lst = self.batch.chunk(chunks=chunks, dim=0)
+        # --- 1) 计算每块的尺寸 sizes ---
+        if isinstance(chunks, int):
+            assert chunks > 0, f"chunks must be positive, got {chunks}"
+            q, r = divmod(N, chunks)
+            sizes = [q + 1] * r + [q] * (chunks - r)   # 前 r 个块多 1
         else:
-            batch_lst = [None for _ in range(chunks)]
+            sizes = list(chunks)
+            assert all(isinstance(x, int) and x >= 0 for x in sizes), f"invalid sizes: {sizes}"
+            assert sum(sizes) == N, f"sum(sizes)={sum(sizes)} must equal len(self)={N}"
 
-        non_tensor_batch_lst = [{} for _ in range(chunks)]
-        for key, val in self.non_tensor_batch.items():
-            assert isinstance(val, np.ndarray)
-            non_tensor_lst = np.array_split(val, chunks)
-            assert len(non_tensor_lst) == chunks
-            for i in range(chunks):
-                non_tensor_batch_lst[i][key] = non_tensor_lst[i]
+        # --- 2) 生成 [start, end) 边界 ---
+        bounds = []
+        start = 0
+        for s in sizes:
+            end = start + s
+            bounds.append((start, end))
+            start = end
 
-        output = []
-        for i in range(chunks):
-            output.append(
-                DataProto(batch=batch_lst[i], non_tensor_batch=non_tensor_batch_lst[i], meta_info=self.meta_info))
+        # --- 3) 逐段切片：TensorDict 与 numpy 对齐切 ---
+        pieces: List[DataProto] = []
+        for (start, end) in bounds:
+            if self.batch is not None:
+                sub_batch = self.batch[slice(start, end)]  # TensorDict 原生切片
+            else:
+                sub_batch = None
 
-        return output
+            sub_non_tensor = {}
+            for key, val in self.non_tensor_batch.items():
+                sub_non_tensor[key] = val[start:end]
 
+            pieces.append(DataProto(batch=sub_batch,
+                                    non_tensor_batch=sub_non_tensor,
+                                    meta_info=self.meta_info))
+        return pieces
     @staticmethod
     def concat(data: List['DataProto']) -> 'DataProto':
         """Concat a list of DataProto. The batch is concatenated among dim=0.
@@ -641,18 +737,23 @@ class DataProto:
             DataProto: concatenated DataProto
         """
         batch_lst = []
-        for batch in data:
-            batch_lst.append(batch.batch)
-        if batch_lst[0] is not None:
-            new_batch = torch.cat(batch_lst, dim=0)
+        for batch in data: 
+            if len(batch) > 0: #ABPO change 
+                batch_lst.append(batch.batch)
+        if batch_lst and batch_lst[0] is not None: #ABPO change
+            # breakpoint()
+            new_batch = concat_tensordict_many(batch_lst) 
+            # new_batch = torch.cat(batch_lst, dim=0)
         else:
             new_batch = None
 
-        non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
+        non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data if len(d)>0 or new_batch is None]) #ABPO change
         for key, val in non_tensor_batch.items():
             non_tensor_batch[key] = np.concatenate(val, axis=0)
 
         return DataProto(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=data[0].meta_info)
+
+
 
     def reorder(self, indices):
         """

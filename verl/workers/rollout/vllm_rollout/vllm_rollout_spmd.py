@@ -39,7 +39,11 @@ from verl.workers.rollout.base import BaseRollout
 from vllm.distributed import parallel_state as vllm_ps
 from vllm import LLM, SamplingParams
 from verl.third_party.vllm import vllm_version
-
+import copy
+import os
+from transformers import AutoTokenizer
+model_path = "./DeepSeek-R1-Distill-Qwen-1.5B"
+tokenizer = AutoTokenizer.from_pretrained(model_path)
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
@@ -86,7 +90,7 @@ class vLLMRollout(BaseRollout):
 
         if kwargs.get('train_tp', None) is not None:
             # deployed with megatron
-            import os
+            # import os
             os.environ['CUDA_TIMER_STREAM_KAFKA_ENABLE'] = '0'
             os.environ['MEGATRON_IMPORT_TIMERS'] = '0'
             train_tp = kwargs.get('train_tp', None)
@@ -100,14 +104,14 @@ class vLLMRollout(BaseRollout):
         max_model_len = self.config.max_model_len if self.config.max_model_len \
                         else config.prompt_length + config.response_length
         max_model_len = int(max_model_len)
-
+        print("max_model_len:",max_model_len)
         if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
             raise ValueError('Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
                              please increase max_num_batched_tokens or disable chunked prefill')
 
         trust_remote_code = kwargs.get('trust_remote_code', False)
         load_format = 'dummy' if config.load_format.startswith('dummy') else config.load_format
-
+        seed = int(os.getenv("RANK", "0")) // tensor_parallel_size
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=True,
@@ -126,6 +130,7 @@ class vLLMRollout(BaseRollout):
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
+            seed=seed, #ABPO add
         )
 
         # Offload vllm model to reduce peak memory usage
@@ -169,6 +174,11 @@ class vLLMRollout(BaseRollout):
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+
+        if len(prompts) == 0: #ABPO change 
+            return prompts
+
+        # breakpoint()
         # rebuild vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.init_cache_engine()
@@ -201,6 +211,9 @@ class vLLMRollout(BaseRollout):
                 'prompt_token_ids': raw_prompt_ids
             } for raw_prompt_ids in non_tensor_batch.pop('raw_prompt_ids')]
 
+        response = None
+
+        # breakpoint()
         # ensure the type of `prompt_token_ids` passed to vllm is list[int]
         # https://github.com/volcengine/verl/pull/772
         for input_data in vllm_inputs:
@@ -230,23 +243,38 @@ class vLLMRollout(BaseRollout):
                 'n': 1,  # if validate, already repeat in ray_trainer
             }
 
-        # users can customize different sampling_params at different run
+
+
         with self.update_sampling_params(**kwargs):
+            if 'max_len' in non_tensor_batch:
+                max_len_list  = non_tensor_batch['max_len']
+            else:
+                max_len_list = [2000] * len(prompts)
+            sampling_params_list = [copy.deepcopy(self.sampling_params) for i in range(len(vllm_inputs))]
+            for i in range(len(sampling_params_list)):
+                sampling_params_list[i].max_tokens = max_len_list[i]
+
+
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
+                sampling_params=sampling_params_list, #self.sampling_params,
                 use_tqdm=False)
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
             response = []
+            final_reasons = []
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
                     response.append(output.outputs[sample_id].token_ids)
+                    final_reasons.append(output.outputs[sample_id].finish_reason)
 
+            final_reasons = [x=='stop' for x in final_reasons]
+            non_tensor_batch["is_complete"] = np.array(final_reasons)
+            # breakpoint()
             response = pad_2d_list_to_length(response, self.pad_token_id,
-                                             max_length=self.config.response_length).to(idx.device)
+                                            max_length=max(max_len_list)).to(idx.device)
 
             if self.sampling_params.n > 1 and do_sample:
                 idx = _repeat_interleave(idx, self.sampling_params.n)
@@ -256,9 +284,16 @@ class vLLMRollout(BaseRollout):
                 if 'multi_modal_inputs' in non_tensor_batch.keys():
                     non_tensor_batch['multi_modal_inputs'] = _repeat_interleave(non_tensor_batch['multi_modal_inputs'],
                                                                                 self.sampling_params.n)
+                if 'extra_info' in non_tensor_batch.keys():
+                    non_tensor_batch['extra_info'] = _repeat_interleave(non_tensor_batch['extra_info'],
+                                                                                self.sampling_params.n)
+                if 'max_len' in non_tensor_batch.keys():
+                    non_tensor_batch['max_len'] = _repeat_interleave(non_tensor_batch['max_len'],
+                                                                                self.sampling_params.n)
 
             seq = torch.cat([idx, response], dim=-1)
 
+        # breakpoint()
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
         delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)

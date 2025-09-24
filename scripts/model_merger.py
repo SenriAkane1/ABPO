@@ -28,7 +28,7 @@ try:
 except ImportError:
     from torch.distributed._tensor import DTensor
 
-from verl.utils.megatron_utils import get_model_checkpoint_path, get_hf_model_checkpoint_path
+# from verl.utils.megatron_utils import get_model_checkpoint_path, get_hf_model_checkpoint_path
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--backend', type=str, required=True, help="The backend of the model")
@@ -196,6 +196,10 @@ def convert_fsdp_checkpoints_to_hfmodels():
 
     print(f'Saving model to {hf_path}')
     model.save_pretrained(hf_path, state_dict=state_dict)
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.hf_model_path)
+    tokenizer.save_pretrained(hf_path)
     del state_dict
     del model
     if args.hf_upload_path:

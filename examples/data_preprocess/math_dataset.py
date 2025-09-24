@@ -52,7 +52,7 @@ if __name__ == '__main__':
         def process_fn(example, idx):
             question = example.pop('problem')
 
-            question = question + ' ' + instruction_following
+            question = question + '\n' + instruction_following
 
             answer = example.pop('solution')
             solution = extract_solution(answer)

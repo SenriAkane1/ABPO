@@ -38,7 +38,7 @@ from verl.workers.rollout.base import BaseRollout
 from verl.third_party.vllm import LLM, vllm_version
 from verl.third_party.vllm import parallel_state as vllm_ps
 from vllm import SamplingParams
-
+import os
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
@@ -78,7 +78,7 @@ class vLLMRollout(BaseRollout):
 
         if kwargs.get('train_tp', None) is not None:
             # deployed with megatron
-            import os
+            # import os
             os.environ['CUDA_TIMER_STREAM_KAFKA_ENABLE'] = '0'
             os.environ['MEGATRON_IMPORT_TIMERS'] = '0'
             train_tp = kwargs.get('train_tp', None)
@@ -97,7 +97,7 @@ class vLLMRollout(BaseRollout):
         if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
             raise ValueError('Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
                              please increase max_num_batched_tokens or disable chunked prefill')
-
+        seed = int(os.getenv("RANK", "0")) // tensor_parallel_size
         self.inference_engine = LLM(
             actor_module,
             tokenizer=tokenizer,
@@ -112,6 +112,7 @@ class vLLMRollout(BaseRollout):
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
+            seed=seed,#ABPO  add
         )
 
         # Offload vllm model to reduce peak memory usage
@@ -155,6 +156,7 @@ class vLLMRollout(BaseRollout):
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        breakpoint()
         # rebuild vllm cache engine
         if self.config.free_cache_engine:
             self.inference_engine.init_cache_engine()

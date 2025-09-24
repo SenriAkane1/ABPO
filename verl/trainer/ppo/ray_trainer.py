@@ -15,8 +15,10 @@
 FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
-
+import jsonlines
+from tensordict import TensorDict
 import os
+import numpy as np
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -45,6 +47,8 @@ from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.utils.tracking import ValidationGenerationsLogger
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
+from verl.trainer.ppo.curriculum_tools import  CurriculumBatchSampler
+import torch.nn.functional as F
 
 WorkerType = Type[Worker]
 
@@ -175,6 +179,7 @@ def compute_response_mask(data: DataProto):
 
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
     # Back-compatible with trainers that do not compute response mask in fit
+    # breakpoint()
     if "response_mask" not in data.batch.keys():
         data.batch['response_mask'] = compute_response_mask(data)
     # prepare response group
@@ -427,15 +432,20 @@ class RayPPOTrainer(object):
             train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
             sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
         else:
-            sampler = SequentialSampler(data_source=self.train_dataset)
+            sampler = CurriculumBatchSampler(dataset_len=len(self.train_dataset),
+                                             batch_size=self.config.data.get('gen_batch_size',
+                                                                                   self.config.data.train_batch_size))
 
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
-                                                   batch_size=self.config.data.get('gen_batch_size',
-                                                                                   self.config.data.train_batch_size),
-                                                   num_workers=8,
-                                                   drop_last=True,
+                                                   num_workers=0,
                                                    collate_fn=collate_fn,
-                                                   sampler=sampler)
+                                                   batch_sampler=sampler)
+        # self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
+        #                                             batch_size=self.config.data.get('gen_batch_size',self.config.data.train_batch_size),
+        #                                            num_workers=8,
+        #                                            drop_last=True,
+        #                                            collate_fn=collate_fn,
+        #                                            sampler=sampler)
 
         self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
                                        tokenizer=self.tokenizer,
@@ -747,6 +757,7 @@ class RayPPOTrainer(object):
         print(f'Load from checkpoint folder: {global_step_folder}')
         # set global step
         self.global_steps = int(global_step_folder.split('global_step_')[-1])
+        # self.global_steps = 0 #ABPO add
 
         print(f'Setting global step to {self.global_steps}')
         print(f'Resuming from {global_step_folder}')
@@ -787,6 +798,69 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def concat_dataproto(self,batch,cache_batch):
+        if len(batch)==0:
+            return cache_batch
+        if len(cache_batch)==0:
+            return batch
+        
+        batch_resp_len = batch.batch['responses'].shape[1]
+        cache_batch_resp_len = cache_batch.batch['responses'].shape[1]
+        print("batch_resp_len:",batch_resp_len)
+        print("cache_batch_resp_len:",cache_batch_resp_len)
+        if batch_resp_len < cache_batch_resp_len:
+            len_flag = 0
+            pad_len = cache_batch_resp_len - batch_resp_len
+        elif batch_resp_len > cache_batch_resp_len:
+            len_flag = 1
+            pad_len = batch_resp_len - cache_batch_resp_len
+        else:
+            len_flag = 2
+        if len_flag != 2:
+            print("pad_len",pad_len)
+            pad_token_id = 151643
+            tmp_batch = batch if len_flag == 0 else cache_batch
+            non_tensor_batch = tmp_batch.non_tensor_batch
+            
+            attention_mask = tmp_batch.batch['attention_mask']
+            input_ids = tmp_batch.batch['input_ids']
+            position_ids = tmp_batch.batch['position_ids']
+            prompts = tmp_batch.batch['prompts']
+            responses = tmp_batch.batch['responses']
+            
+            
+            attention_mask = F.pad(attention_mask,(0,pad_len),value=0)
+            input_ids = F.pad(input_ids,(0,pad_len),value=pad_token_id)
+            responses = F.pad(responses,(0,pad_len),value=pad_token_id)
+
+            
+            device = position_ids.device
+            dtype = position_ids.dtype
+            delta_position_id = torch.arange(1, pad_len + 1, device=device, dtype=dtype)
+            delta_position_id = delta_position_id.unsqueeze(0).expand(len(tmp_batch), -1)
+            padding_position_ids = position_ids[:, -1:] + delta_position_id
+            position_ids = torch.cat([position_ids, padding_position_ids], dim=-1)
+
+            tmp_batch_dict = TensorDict({
+                                'prompts': prompts,
+                                'responses': responses,
+                                'input_ids': input_ids, 
+                                'attention_mask': attention_mask,
+                                'position_ids': position_ids
+                            },
+                            batch_size=len(tmp_batch))
+            tmp_batch = DataProto(batch=tmp_batch_dict, non_tensor_batch=non_tensor_batch)
+
+            if len_flag==0:
+                batch = tmp_batch
+            else:
+                cache_batch = tmp_batch
+        try:
+            result = DataProto.concat([batch,cache_batch])
+        except Exception as e:
+            breakpoint()
+        return result
+
     def fit(self):
         """
         The training loop of PPO.
@@ -821,14 +895,137 @@ class RayPPOTrainer(object):
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
+        # breakpoint()
 
-        for epoch in range(self.config.trainer.total_epochs):
+        cache_rollout = None #存储转阶段的输出
+        cache_idx = None #被存下来的id
+
+
+        #最开始要转第一阶段
+        delta = 0.2
+
+        if self.train_dataloader.batch_sampler.should_advance_stage():
+            self.train_dataloader.batch_sampler.set_mode('hard')
+            hard_batch_dict = next(iter(self.train_dataloader))
+            hard_batch = DataProto.from_single_dict(hard_batch_dict)
+
+            gen_hard_batch = hard_batch.pop(
+                batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                non_tensor_batch_keys=['raw_prompt_ids','extra_info'],
+            )
+
+            #获取最大输出长度
+            indices = [gen_hard_batch[i].non_tensor_batch['extra_info']['index'] for i in range(len(gen_hard_batch))]
+            max_len_list = self.train_dataloader.batch_sampler.get_max_lengths(indices)
+            gen_hard_batch.non_tensor_batch['max_len'] = np.array(max_len_list)
+
+            # breakpoint()
+            gen_hard_batch_output = self.actor_rollout_wg.generate_sequences(gen_hard_batch)
+            hard_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(hard_batch.batch))],
+                                                        dtype=object)
+            #获取reward
+            group_size = self.config.actor_rollout_ref.rollout.n
+            hard_batch = hard_batch.repeat(repeat_times=group_size, interleave=True)
+            hard_batch = hard_batch.union(gen_hard_batch_output)
+            reward_result = self.reward_fn(hard_batch, return_dict=True)
+            reward_tensor = reward_result['reward_tensor']
+            reward_list = reward_tensor.sum(dim=-1).cpu().tolist()
+
+            acc_per_group = [sum(reward_list[i:i+group_size]) / group_size for i in range(0, len(reward_list), group_size)]
+            
+            index_list = [i for i,acc in enumerate(acc_per_group) if acc>delta]
+            indices = [gen_hard_batch[index].non_tensor_batch['extra_info']['index'] for index in index_list]
+
+            cache_idx = set(index_list)
+            # breakpoint()
+            #更新cache_rollout
+            cache_rollout = hard_batch.select_idxs([i for i in range(len(hard_batch)) if \
+                                            hard_batch[i].non_tensor_batch['extra_info']['index'] in cache_idx])
+            
+
+            #移动hard问题到正在学中
+            self.train_dataloader.batch_sampler.advance_stage()
+            self.train_dataloader.batch_sampler.move_hard_to_learning(indices)
+            self.train_dataloader.batch_sampler.set_mode('train')
+
+
+
+        # breakpoint()
+        while True:
+            if self.train_dataloader.batch_sampler.should_advance_stage():
+
+
+                self.train_dataloader.batch_sampler.set_mode('hard')
+                hard_batch_dict = next(iter(self.train_dataloader))
+                hard_batch = DataProto.from_single_dict(hard_batch_dict)
+
+                gen_hard_batch = hard_batch.pop(
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                    non_tensor_batch_keys=['raw_prompt_ids','extra_info'],
+                )
+
+                #获取最大输出长度
+                indices = [gen_hard_batch[i].non_tensor_batch['extra_info']['index'] for i in range(len(gen_hard_batch))] #索引列表
+                max_len_list = self.train_dataloader.batch_sampler.get_max_lengths(indices)
+                # print("转阶段len:",max_len_list)
+                gen_hard_batch.non_tensor_batch['max_len'] = np.array(max_len_list)
+
+                gen_hard_batch_output = self.actor_rollout_wg.generate_sequences(gen_hard_batch)
+                hard_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(hard_batch.batch))],
+                                                            dtype=object)
+                #获取reward
+                group_size = self.config.actor_rollout_ref.rollout.n
+                hard_batch = hard_batch.repeat(repeat_times=group_size, interleave=True)
+                hard_batch = hard_batch.union(gen_hard_batch_output)
+                reward_result = self.reward_fn(hard_batch, return_dict=True)
+                reward_tensor = reward_result['reward_tensor']
+                reward_list = reward_tensor.sum(dim=-1).cpu().tolist()
+
+                acc_per_group = [sum(reward_list[i:i+group_size]) / group_size for i in range(0, len(reward_list), group_size)]
+                
+
+                index_list = [indices[i] for i,acc in enumerate(acc_per_group) if acc>delta]
+
+                tmp_cache_idx = set(index_list)
+
+
+                # breakpoint()
+                #更新cache_rollout
+                tmp_cache_rollout = hard_batch.select_idxs([i for i in range(len(hard_batch)) if \
+                                                hard_batch[i].non_tensor_batch['extra_info']['index'] in tmp_cache_idx])
+                
+                cache_idx = cache_idx | tmp_cache_idx
+
+                cache_rollout = self.concat_dataproto(tmp_cache_rollout,cache_rollout)
+
+                #移动hard问题到正在学中
+                self.train_dataloader.batch_sampler.advance_stage()
+                self.train_dataloader.batch_sampler.move_hard_to_learning(index_list)
+                self.train_dataloader.batch_sampler.set_mode('train')
+                
+
             for batch_dict in self.train_dataloader:
+                print("len_cached:",len(cache_idx))
+                # print("cached:",cache_idx)
+                # breakpoint()
                 metrics = {}
                 timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                #根据cache_idx来判断哪些需要gen，哪些不需要，把需要gen的放前面，不需要的放后面
+                indices = [batch[index].non_tensor_batch['extra_info']['index'] for index in range(len(batch))]
+                cache_indices = list(set(indices) & cache_idx)
+                uncache_indices = list(set(indices) - set(cache_indices))
+                if not uncache_indices:
+                    all_cached_flag = True
+                else:
+                    all_cached_flag = False
 
+                batch = batch.select_idxs([i for i in range(len(batch)) if \
+                                            batch[i].non_tensor_batch['extra_info']['index'] in uncache_indices]) #还没缓存的部分
+
+                
+                
                 # pop those keys for generation
                 if 'multi_modal_inputs' in batch.non_tensor_batch.keys():
                     gen_batch = batch.pop(
@@ -838,43 +1035,62 @@ class RayPPOTrainer(object):
                 else:
                     gen_batch = batch.pop(
                         batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                        non_tensor_batch_keys=['raw_prompt_ids'],
+                        non_tensor_batch_keys=['raw_prompt_ids','extra_info'],
                     )
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
+                # breakpoint()
                 with _timer('step', timing_raw):
                     # generate a batch
-                    with _timer('gen', timing_raw):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                    with _timer('gen', timing_raw):                        
+                        if not all_cached_flag: #存在未缓存的数据才生成
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        with _timer('gen_max', timing_raw):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info['do_sample'] = False
-                            gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-
-                            batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
-
-                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
-
-                            batch.batch['reward_baselines'] = reward_baseline_tensor
-
-                            del gen_baseline_batch, gen_baseline_output
+                            #获取最大输出长度
+                            indices = [gen_batch[i].non_tensor_batch['extra_info']['index'] for i in range(len(gen_batch))]
+                            max_len_list = self.train_dataloader.batch_sampler.get_max_lengths(indices)
+                            print("max_len_list_max:",max(max_len_list))
+                            gen_batch.non_tensor_batch['max_len'] = np.array(max_len_list)
+                            # breakpoint()
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            # breakpoint()
+                        print("generate complete!!!")
+                        # breakpoint()
 
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                             dtype=object)
+                                                                dtype=object)
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+
+                    #没有全缓存
+                    if not all_cached_flag:
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                        batch = batch.union(gen_batch_output)
+                        #把已缓存的部分加进来
+                        cache_batch = cache_rollout.select_idxs([i for i in range(len(cache_rollout)) if \
+                                            cache_rollout[i].non_tensor_batch['extra_info']['index'] in cache_indices])
+
+                        # breakpoint()
+
+                        batch = self.concat_dataproto(batch,cache_batch)
+                    else: #有全缓存则直接把缓存的部分拿来
+                        batch = cache_rollout.select_idxs([i for i in range(len(cache_rollout)) if \
+                                            cache_rollout[i].non_tensor_batch['extra_info']['index'] in cache_indices])
+                        
+                    #获取每个数据的索引
+                    all_indices = [batch[index].non_tensor_batch['extra_info']['index'] for index in range(len(batch))]
+                    all_indices = [all_indices[i] for i in range(0,len(all_indices),group_size)]
+
+                    #删去已经使用的缓存
+                    cache_idx = cache_idx - set(cache_indices)
+                    cache_rollout = cache_rollout.select_idxs([i for i in range(len(cache_rollout)) if \
+                                                    cache_rollout[i].non_tensor_batch['extra_info']['index'] in cache_idx])
 
                     batch.batch['response_mask'] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
                     if self.config.trainer.balance_batch:
+                        # breakpoint()
                         self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
@@ -883,6 +1099,7 @@ class RayPPOTrainer(object):
                     # recompute old_log_probs
                     with _timer('old_log_prob', timing_raw):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        print("compute_log_prob complete!!!")
                         batch = batch.union(old_log_prob)
 
                     if self.use_reference_policy:
@@ -903,12 +1120,13 @@ class RayPPOTrainer(object):
                         # the results from reward model and rule-based results.
                         if self.use_rm:
                             # we first compute reward model score
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            reward_tensor = self.rm_wg.compute_rm_score(batch)                                        
                             batch = batch.union(reward_tensor)
 
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         try:
+                            # breakpoint()
                             reward_result = self.reward_fn(batch, return_dict=True)
                             reward_tensor = reward_result['reward_tensor']
                             reward_extra_infos_dict = reward_result['reward_extra_info']
@@ -916,9 +1134,24 @@ class RayPPOTrainer(object):
                             print(f'Error in reward_fn: {e}')
                             reward_tensor = self.reward_fn(batch)
                             reward_extra_infos_dict = {}
-
+                        
+                        print("get reward complete!!!")
                         batch.batch['token_level_scores'] = reward_tensor
 
+
+                        #通过reward来看数据是放入mastered还是learning
+                        reward_list = reward_tensor.sum(dim=-1).cpu().tolist()
+                        acc_per_group = [sum(reward_list[i:i+group_size]) / group_size for i in range(0, len(reward_list), group_size)]
+                        self.train_dataloader.batch_sampler.update_with_rewards(indices=all_indices,rewards=acc_per_group)
+
+
+                        
+                        #保存reward
+                        reward_save_path = self.config.get("reward_save_path",None)
+                        if reward_save_path:
+                            with jsonlines.open(reward_save_path,"a") as f:
+                                f.write(reward_tensor.sum(dim=-1).cpu().tolist())
+                                
                         print(f'{list(reward_extra_infos_dict.keys())=}')
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -926,19 +1159,20 @@ class RayPPOTrainer(object):
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl_in_reward,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
+                                                                    kl_ctrl=self.kl_ctrl_in_reward,
+                                                                    kl_penalty=self.config.algorithm.kl_penalty)
                             metrics.update(kl_metrics)
                         else:
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
+                        # breakpoint()
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
-
+                                                    adv_estimator=self.config.algorithm.adv_estimator,
+                                                    gamma=self.config.algorithm.gamma,
+                                                    lam=self.config.algorithm.lam,
+                                                    num_repeat=self.config.actor_rollout_ref.rollout.n)
+                        print("compute_advantage complete!!!")
                     # update critic
                     if self.use_critic:
                         with _timer('update_critic', timing_raw):
@@ -951,6 +1185,7 @@ class RayPPOTrainer(object):
                         # update actor
                         with _timer('update_actor', timing_raw):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+                            print("update_actor complete!!!")
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
 
@@ -963,8 +1198,9 @@ class RayPPOTrainer(object):
                                 last_val_metrics = val_metrics
                         metrics.update(val_metrics)
 
-                    if self.config.trainer.save_freq > 0 and ( is_last_step or \
-                            self.global_steps % self.config.trainer.save_freq == 0):
+                    #ABPO add  转阶段前保存
+                    if self.train_dataloader.batch_sampler.should_advance_stage() or (self.config.trainer.save_freq > 0 and ( is_last_step or \
+                            self.global_steps % self.config.trainer.save_freq == 0)):
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
 

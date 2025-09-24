@@ -17,6 +17,7 @@ pylint==3.3.6
 ray[default]
 tensordict<=0.6.2
 torchdata
+math_verify
 transformers
 # vllm==0.6.3.post1
 wandb
